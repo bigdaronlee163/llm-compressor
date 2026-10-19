@@ -18,6 +18,7 @@ from compressed_tensors.entrypoints.convert.converters import Converter
 from compressed_tensors.quantization import QuantizationConfig
 from compressed_tensors.utils.moe import (
     build_expert_to_router_map,
+    common_prefix_len,
     extract_expert_index,
     get_num_experts_config_key,
     get_num_experts_per_tok,
@@ -35,6 +36,15 @@ __all__ = ["ExpertPruner"]
 
 # metrics which are read from a saliency report written by ``REAPPruningModifier``
 REPORT_METRICS = ("saliency", "layerwise_saliency", "count")
+
+# report field holding each metric's values: the report maps ``saliency`` and
+# ``counts`` to dicts of MoE layer name (the experts module name) to that
+# layer's per-expert values
+REPORT_METRIC_KEYS = {
+    "saliency": "saliency",
+    "layerwise_saliency": "saliency",
+    "count": "counts",
+}
 
 # config.json keys declaring group-limited routing (e.g. DeepSeek-V3): experts
 # are partitioned into ``n_group`` contiguous groups and only experts of the
@@ -174,7 +184,8 @@ class ExpertPruner(Converter):
             If None, auto-detected from config.json.
         :param saliency_report_path: path to the ``.json`` report written by
             ``REAPPruningModifier``. Required for every metric but
-            ``"magnitude"``. Its layers must be ordered by layer index
+            ``"magnitude"``. Report layers are matched to router weights by
+            name, so the report must be generated from the same model
         """
         if not 0 <= sparsity <= 1:
             raise ValueError(f"sparsity must be in [0, 1], got {sparsity}")
@@ -223,8 +234,8 @@ class ExpertPruner(Converter):
                 "the router makes routable per token"
             )
 
-        # collect router and expert tensor names. Routers are ordered by natural
-        # (numeric) layer order to match the saliency report
+        # collect router and expert tensor names. Routers are ordered by
+        # natural (numeric) layer order for deterministic output
         router_names = sorted(
             (n for n in weight_map if router_re.search(n)), key=_natural_sort_key
         )
@@ -659,14 +670,17 @@ def _report_scores(
 ) -> dict[str, torch.Tensor]:
     """
     Read per-expert scores for ``metric`` from a saliency report written by
-    ``REAPPruningModifier``. The report holds one list of per-expert values per
-    MoE layer, ordered by layer, which are matched to ``router_names`` in order.
-    Only router shapes are read from the checkpoint, to validate the report.
+    ``REAPPruningModifier``. The report maps each field (``saliency``,
+    ``counts``) to a dict of MoE layer name (the experts module name) to that
+    layer's per-expert values. Layers are matched to router weights by name
+    (see :func:`_match_report_layers`), so dense layers cannot be mistaken for
+    MoE layers and vice versa. Only router shapes are read from the checkpoint,
+    to validate the report.
     """
     with open(report_path, "r") as file:
         report = json.load(file)
 
-    key = "saliency" if metric == "layerwise_saliency" else metric
+    key = REPORT_METRIC_KEYS[metric]
     if key not in report:
         raise ValueError(
             f"Report {report_path} does not contain {key!r} values; "
@@ -674,12 +688,17 @@ def _report_scores(
         )
     layer_values = report[key]
 
-    if len(layer_values) != len(router_names):
+    if not isinstance(layer_values, dict):
         raise ValueError(
-            f"Report {report_path} contains {len(layer_values)} layer(s), but "
-            f"{len(router_names)} router weight(s) were found in the checkpoint. "
-            "The report must be generated from the same model"
+            f"Report {report_path} holds {key!r} values as a "
+            f"{type(layer_values).__name__}; expected a dict mapping layer "
+            "names to per-expert values. The report may be in an outdated "
+            "format; regenerate it with a current REAPPruningModifier"
         )
+
+    router_to_layer = _match_report_layers(
+        router_names, list(layer_values), report_path
+    )
 
     num_experts: dict[str, int] = {}
     for path, names in _group_by_file(router_names, weight_map, model_files).items():
@@ -688,10 +707,12 @@ def _report_scores(
                 num_experts[rname] = f.get_slice(rname).get_shape()[0]
 
     scores: dict[str, torch.Tensor] = {}
-    for rname, values in zip(router_names, layer_values):
+    for rname in router_names:
+        layer_name = router_to_layer[rname]
+        values = layer_values[layer_name]
         if len(values) != num_experts[rname]:
             raise ValueError(
-                f"Report layer for {rname} has {len(values)} experts, but the "
+                f"Report layer {layer_name} has {len(values)} experts, but the "
                 f"checkpoint has {num_experts[rname]}. The report must be "
                 "generated from the same model"
             )
@@ -703,6 +724,59 @@ def _report_scores(
         scores[rname] = layer_scores
 
     return scores
+
+
+def _match_report_layers(
+    router_names: list[str],
+    layer_names: list[str],
+    report_path: str | os.PathLike,
+) -> dict[str, str]:
+    """
+    Match each router weight to its report layer. Report layers are keyed by
+    their experts module name (e.g. ``model.layers.0.mlp.experts``), which
+    shares its MoE block prefix with the layer's router tensor name (e.g.
+    ``model.layers.0.mlp.gate.weight``); each router is matched to the layer
+    with the longest common dot-separated prefix.
+
+    Matching by name rather than list order keeps layers that only appear on
+    one side (e.g. dense MLP layers caught by a loose ``router_pattern``, or
+    report layers with no router weight) from silently shifting the alignment:
+    an ambiguous or unmatched layer raises instead.
+    """
+    if not layer_names:
+        raise ValueError(f"Report {report_path} contains no layers")
+
+    router_to_layer: dict[str, str] = {}
+    for rname in router_names:
+        prefix_lens = {layer: common_prefix_len(rname, layer) for layer in layer_names}
+        best = max(prefix_lens.values())
+        matches = [layer for layer, plen in prefix_lens.items() if plen == best]
+        if len(matches) > 1:
+            raise ValueError(
+                f"Router weight {rname} matches multiple report layers "
+                f"{sorted(matches)}; the report must be generated from the "
+                "same model"
+            )
+        router_to_layer[rname] = matches[0]
+
+    for layer in layer_names:
+        matched_routers = [
+            rname for rname, match in router_to_layer.items() if match == layer
+        ]
+        if len(matched_routers) > 1:
+            raise ValueError(
+                f"Report layer {layer} matches multiple router weights "
+                f"{sorted(matched_routers)}; the report must be generated "
+                "from the same model"
+            )
+        if not matched_routers:
+            raise ValueError(
+                f"Report layer {layer} does not match any router weight in "
+                "the checkpoint; the report must be generated from the same "
+                "model"
+            )
+
+    return router_to_layer
 
 
 def _compute_retained_experts(

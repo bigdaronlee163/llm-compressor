@@ -1,11 +1,11 @@
 """Plot a REAP expert-saliency report (`.json`) as a heatmap.
 
-The report is a JSON object whose values are lists of per-MoE-layer lists (one
-inner list per layer, ordered by layer). The per-expert fields available for
-plotting are:
+The report is a JSON object mapping each metric to a dict of MoE layer name
+(the experts module name, e.g. ``model.layers.0.mlp.experts``) to that layer's
+list of per-expert values. The per-expert fields available for plotting are:
 
 - ``saliency``: REAP saliency ``S_j = mean(g_j * ||f_j||_2)`` per expert
-- ``count``: number of tokens routed to each expert
+- ``counts``: number of tokens routed to each expert
 - ``layerwise``: ``saliency`` normalized by each layer's maximum value, with a
   per-layer excess-kurtosis label at the right of each row
 
@@ -16,12 +16,13 @@ the left, lowest on the right).
 Usage::
 
     python plot_reap_report.py report.json
-    python plot_reap_report.py report.json --metric count -o count.png
+    python plot_reap_report.py report.json --metric counts -o counts.png
     python plot_reap_report.py report.json --metric layerwise -o layerwise.png
 """
 
 import argparse
 import json
+import re
 from pathlib import Path
 
 import matplotlib
@@ -36,6 +37,21 @@ def load_report(path: Path) -> dict:
         return json.load(f)
 
 
+def natural_key(name: str) -> list:
+    """Sort key ordering embedded integers numerically (``layers.2`` before
+    ``layers.10``)."""
+    return [
+        int(token) if token.isdigit() else token for token in re.split(r"(\d+)", name)
+    ]
+
+
+def layer_label(name: str, row: int) -> int:
+    """Decoder layer index parsed from a layer name, falling back to the row
+    position when the name carries no index."""
+    match = re.search(r"layers\.(\d+)\.", name)
+    return int(match.group(1)) if match else row
+
+
 def kurtosis(values: np.ndarray) -> float:
     """Excess (Fisher) kurtosis of a 1-D array of values."""
     mean = values.mean()
@@ -47,6 +63,7 @@ def kurtosis(values: np.ndarray) -> float:
 
 def plot_heatmap(
     rows: list[list[float]],
+    layer_names: list[str],
     title: str,
     out_path: Path,
     metric: str,
@@ -79,7 +96,7 @@ def plot_heatmap(
     ax.set_xticks(range(matrix.shape[1]))
     ax.set_xticklabels(range(1, matrix.shape[1] + 1))
     ax.set_yticks(range(matrix.shape[0]))
-    ax.set_yticklabels(range(matrix.shape[0]))
+    ax.set_yticklabels([layer_label(name, row) for row, name in enumerate(layer_names)])
 
     if layerwise_norm:
         # Label each layer (row) with its kurtosis on the right-hand side.
@@ -105,7 +122,7 @@ def main() -> None:
     parser.add_argument("report", type=Path, help="Path to the .json REAP report")
     parser.add_argument(
         "--metric",
-        choices=("saliency", "count", "layerwise"),
+        choices=("saliency", "counts", "layerwise"),
         default="saliency",
         help=(
             "Per-expert field to plot; 'layerwise' is saliency normalized "
@@ -122,15 +139,26 @@ def main() -> None:
     args = parser.parse_args()
 
     report = load_report(args.report)
-    if args.metric != "layerwise" and args.metric not in report:
+    field = "saliency" if args.metric == "layerwise" else args.metric
+    if field not in report:
         raise SystemExit(
-            f"Report {args.report} has no '{args.metric}' field; "
+            f"Report {args.report} has no '{field}' field; "
             f"available: {', '.join(sorted(report))}"
         )
-    rows = report["saliency"] if args.metric == "layerwise" else report[args.metric]
+    layers = report[field]
+    if not isinstance(layers, dict):
+        raise SystemExit(
+            f"Report {args.report} holds '{field}' as a "
+            f"{type(layers).__name__}; expected a dict mapping layer names to "
+            "per-expert values. The report may be in an outdated format; "
+            "regenerate it with a current REAPPruningModifier"
+        )
+    layer_names = sorted(layers, key=natural_key)
+    rows = [layers[name] for name in layer_names]
+
     out_path = args.output or args.report.with_suffix(".png")
     title = f"{args.report.stem} REAP {args.metric}"
-    plot_heatmap(rows, title, out_path, metric=args.metric)
+    plot_heatmap(rows, layer_names, title, out_path, metric=args.metric)
 
 
 if __name__ == "__main__":

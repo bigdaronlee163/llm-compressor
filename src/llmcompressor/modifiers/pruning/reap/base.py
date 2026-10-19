@@ -62,12 +62,13 @@ class REAPPruningModifier(Modifier):
         config are never modified.
     :param ignore: module name patterns to skip during MoE layer detection.
     :param report_path: optional path to a ``.json`` file where the per-expert
-        statistics are written after calibration completes. The report is a JSON
-        object mapping ``topk_weights``, ``count``, and ``saliency`` to one inner
-        list per MoE layer (ordered by layer). Use
-        ``tools/plot_reap_report.py`` to generate a saliency visualization.
-        Required when ``sparsity`` is ``0.0``, since the report is then the
-        modifier's only output.
+        statistics are written after calibration completes. The report is a
+        JSON object mapping ``saliency`` and ``counts`` to dicts which map each
+        MoE layer's experts module name (e.g.
+        ``model.layers.0.mlp.experts``) to that layer's list of per-expert
+        values. Use ``tools/plot_reap_report.py`` to generate a saliency
+        visualization. Required when ``sparsity`` is ``0.0``, since the report
+        is then the modifier's only output.
 
     Example recipe::
 
@@ -258,12 +259,14 @@ class REAPPruningModifier(Modifier):
             update_model_config(model, self._moe_attrs, new_num_experts)
 
         if self.report_path is not None and is_source_process():
+            experts_attr = self._moe_attrs.experts_attr
             report = {
-                key: [
-                    self._report[layer_name].get(key, [])
+                key: {
+                    f"{layer_name}.{experts_attr}": self._report[layer_name][key]
                     for layer_name in self._moe_attrs.moe_layer_names
-                ]
-                for key in ("topk_weights", "count", "saliency")
+                    if layer_name in self._report
+                }
+                for key in ("saliency", "counts")
             }
             with open(self.report_path, "w") as file:
                 json.dump(report, file)
@@ -298,11 +301,10 @@ class REAPPruningModifier(Modifier):
         for layer_name, tracker in trackers:
             tracker.reduce_saliency_stats(device, group=self._cpu_pg)
 
-            # record per-expert saliency for the report (source rank holds the
+            # record per-expert statistics for the report (source rank holds the
             # globally reduced statistics)
             if is_source_process():
-                self._report[layer_name]["count"] = tracker.count.tolist()
-                self._report[layer_name]["topk_weights"] = tracker.topk_weights.tolist()
+                self._report[layer_name]["counts"] = tracker.count.tolist()
                 self._report[layer_name]["saliency"] = tracker.mean_saliency.tolist()
 
             if self._n_experts_to_drop > 0:

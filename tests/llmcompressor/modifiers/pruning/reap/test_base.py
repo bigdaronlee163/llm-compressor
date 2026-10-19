@@ -877,24 +877,26 @@ def test_reap_report_only_does_not_modify_model(tmp_path):
         assert expert_count == 8
         assert layer.gate.weight.shape[0] == 8
 
-    # Report holds per-expert statistics for each MoE layer, ordered by layer
+    # Report holds per-expert statistics for each MoE layer, keyed by the
+    # layer's experts module name
     with open(report_path) as f:
         report = json.load(f)
 
-    assert sorted(report) == ["count", "saliency", "topk_weights"]
-    for values in report.values():
-        assert len(values) == 2
+    assert sorted(report) == ["counts", "saliency"]
+    experts_names = [
+        f"{layer_name}.experts" for layer_name in modifier._moe_attrs.moe_layer_names
+    ]
+    for metric_values in report.values():
+        assert sorted(metric_values) == sorted(experts_names)
 
-    for layer_counts, layer_saliency in zip(report["count"], report["saliency"]):
+    for experts_name in experts_names:
+        layer_counts = report["counts"][experts_name]
+        layer_saliency = report["saliency"][experts_name]
         assert len(layer_counts) == 8
         assert len(layer_saliency) == 8
         assert all(isinstance(value, float) for value in layer_saliency)
         # every expert was routed to at least once across the 5 batches
         assert all(count > 0 for count in layer_counts)
-
-    # topk_weights holds the last batch's router weights, [num_tokens, top_k]
-    assert len(report["topk_weights"][0]) == 2 * 8
-    assert all(len(weights) == 2 for weights in report["topk_weights"][0])
 
 
 @pytest.mark.unit

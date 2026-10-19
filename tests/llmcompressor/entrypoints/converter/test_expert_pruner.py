@@ -107,10 +107,22 @@ def _write_checkpoint(
 
 
 def _write_report(path, saliency, count=None):
+    """Write a REAP report mapping each metric to ``layer name -> per-expert
+    values``.
+
+    ``saliency`` / ``count`` may be given as dicts (used as-is, so tests can
+    control layer names) or as lists of per-layer lists, in which case layer
+    ``i`` is keyed ``model.layers.{i}.mlp.experts``."""
     count = saliency if count is None else count
-    path.write_text(
-        json.dumps({"saliency": saliency, "count": count, "topk_weights": saliency})
-    )
+
+    def keyed(values):
+        if isinstance(values, dict):
+            return values
+        return {
+            f"model.layers.{i}.mlp.experts": layer for i, layer in enumerate(values)
+        }
+
+    path.write_text(json.dumps({"saliency": keyed(saliency), "counts": keyed(count)}))
 
 
 def _descending_report(path, n_layers, n_experts):
@@ -262,11 +274,26 @@ def test_report_scores_layerwise_saliency_divides_by_layer_max(tmp_path):
 def test_report_scores_missing_metric_raises(tmp_path):
     _write_checkpoint(tmp_path, n_layers=1, n_experts=3)
     report = tmp_path / "r.json"
+    report.write_text(
+        json.dumps({"saliency": {"model.layers.0.mlp.experts": [1.0, 2.0, 3.0]}})
+    )
+
+    routers, weight_map, model_files = _checkpoint_meta(tmp_path)
+    with pytest.raises(ValueError, match="does not contain 'counts'"):
+        _report_scores(routers, weight_map, model_files, report, "count")
+
+
+def test_report_scores_rejects_legacy_order_based_format(tmp_path):
+    # reports written before layer names were encoded explicitly held one list
+    # per layer, ordered by layer; they must be rejected with guidance rather
+    # than silently misaligned
+    _write_checkpoint(tmp_path, n_layers=1, n_experts=3)
+    report = tmp_path / "r.json"
     report.write_text(json.dumps({"saliency": [[1.0, 2.0, 3.0]]}))
 
     routers, weight_map, model_files = _checkpoint_meta(tmp_path)
-    with pytest.raises(ValueError, match="does not contain 'count'"):
-        _report_scores(routers, weight_map, model_files, report, "count")
+    with pytest.raises(ValueError, match="outdated"):
+        _report_scores(routers, weight_map, model_files, report, "saliency")
 
 
 # ---------------------------------------------------------------------------
@@ -300,10 +327,12 @@ def test_from_pretrained_rejects_bad_sparsity(tmp_path, sparsity):
 
 
 def test_from_pretrained_rejects_layer_count_mismatch(tmp_path):
+    # a report with 3 layers cannot cover the checkpoint's 4 routers: the
+    # unmatched router matches several report layers equally (and vice versa)
     _write_checkpoint(tmp_path, n_layers=4, n_experts=8)
     report = tmp_path / "r.json"
     _descending_report(report, 3, 8)  # 3 layers vs 4 routers
-    with pytest.raises(ValueError, match="router weight"):
+    with pytest.raises(ValueError, match="same model"):
         _pruner(tmp_path, sparsity=0.25, metric="saliency", saliency_report_path=report)
 
 
@@ -349,15 +378,20 @@ def test_from_pretrained_no_routers_or_experts_raises(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_natural_ordering_aligns_report_to_layers(tmp_path):
-    # 12 layers; reverse the ranking of layer 10 only. If the report were aligned
-    # to routers lexicographically (0,1,10,11,2,...), report[10] would land on
-    # layer 8 instead
+def test_report_layers_matched_by_name_not_order(tmp_path):
+    # 12 layers; reverse the ranking of layer 10 only. Layers are matched to
+    # routers by name, so layer 10's inverted ranking lands on layer 10
+    # regardless of the order the report layers are written in
     _write_checkpoint(tmp_path, n_layers=12, n_experts=8)
-    saliency = [[float(8 - e) for e in range(8)] for _ in range(12)]
-    saliency[10] = [float(e) for e in range(8)]
+    saliency = {
+        f"model.layers.{i}.mlp.experts": [float(8 - e) for e in range(8)]
+        for i in range(12)
+    }
+    saliency["model.layers.10.mlp.experts"] = [float(e) for e in range(8)]
     report = tmp_path / "r.json"
-    _write_report(report, saliency)
+    # write the layers in reverse order, which order-based matching would
+    # silently misalign
+    _write_report(report, dict(reversed(list(saliency.items()))))
 
     pruner = _pruner(
         tmp_path, sparsity=0.5, metric="saliency", saliency_report_path=report
@@ -366,6 +400,44 @@ def test_natural_ordering_aligns_report_to_layers(tmp_path):
         retained = pruner.retained_experts[f"model.layers.{layer}.mlp.gate.weight"]
         expected = [4, 5, 6, 7] if layer == 10 else [0, 1, 2, 3]
         assert retained == expected
+
+
+def test_report_matching_rejects_dense_gate_tensors(tmp_path):
+    # a loose router_pattern also matches a dense layer's gate_proj tensor;
+    # with explicit layer names the ambiguity must raise instead of silently
+    # misaligning every layer after the dense one (order-based matching)
+    _write_checkpoint(tmp_path, n_layers=2, n_experts=4)
+    tensors = _load_all(tmp_path / "model.safetensors")
+    tensors["model.layers.0.mlp.gate_proj.weight"] = torch.randn(4, 8)
+    save_file(tensors, str(tmp_path / "model.safetensors"))
+    report = tmp_path / "r.json"
+    _descending_report(report, 2, 4)
+
+    with pytest.raises(ValueError, match="multiple router weights"):
+        _pruner(
+            tmp_path,
+            sparsity=0.25,
+            metric="saliency",
+            router_pattern=r"mlp\.gate.*weight$",
+            saliency_report_path=report,
+        )
+
+
+def test_report_matching_rejects_unknown_layer_names(tmp_path):
+    # a report layer that matches no router weight (e.g. from a different
+    # model) must raise rather than be silently ignored
+    _write_checkpoint(tmp_path, n_layers=1, n_experts=4)
+    report = tmp_path / "r.json"
+    _write_report(
+        report,
+        {
+            "model.layers.0.mlp.experts": [4.0, 3.0, 2.0, 1.0],
+            "decoder.blocks.7.ffn.experts": [1.0, 2.0, 3.0, 4.0],
+        },
+    )
+
+    with pytest.raises(ValueError, match="does not match any router weight"):
+        _pruner(tmp_path, sparsity=0.25, metric="saliency", saliency_report_path=report)
 
 
 def test_metrics_select_different_experts(tmp_path):
@@ -923,6 +995,12 @@ SMOKE_MODELS = [
 ]
 
 
+def _experts_name(router_name: str) -> str:
+    """Experts module name matching a router tensor name
+    (``model.layers.0.mlp.gate.weight`` -> ``model.layers.0.mlp.experts``)."""
+    return ".".join(router_name.split(".")[:-2]) + ".experts"
+
+
 def _build_matching_report(model_stub, report_path):
     """Build a correctly-shaped descending-saliency report for a real checkpoint
     by reading its router layout, so no real calibration run is needed."""
@@ -931,9 +1009,12 @@ def _build_matching_report(model_stub, report_path):
     for router in routers:
         with safe_open(model_files[weight_map[router]], framework="pt") as f:
             num_experts[router] = f.get_slice(router).get_shape()[0]
-    saliency = [
-        [float(num_experts[r] - e) for e in range(num_experts[r])] for r in routers
-    ]
+    saliency = {
+        _experts_name(router): [
+            float(num_experts[router] - e) for e in range(num_experts[router])
+        ]
+        for router in routers
+    }
     _write_report(report_path, saliency)
     return routers, num_experts
 
