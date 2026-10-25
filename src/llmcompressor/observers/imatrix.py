@@ -7,6 +7,7 @@ from torch import distributed as dist
 from torch.utils.hooks import RemovableHandle
 
 from llmcompressor.modifiers.utils.hooks import HooksMixin
+from llmcompressor.modifiers.utils.masking import mask_activations_with_loss_mask
 from llmcompressor.observers.base import Observer
 from llmcompressor.observers.grid_search import (
     _default_triton_error_buffer,
@@ -32,6 +33,10 @@ class IMatrixMSEObserver(Observer):
     Importance is accumulated on the observer as raw ``_imatrix_sum`` /
     ``_imatrix_count`` and synced across DDP ranks via ``_act_sync_dict``
     before observation.
+
+    When the calibration dataset provides a ``loss_mask`` and
+    ``use_loss_mask=True``, only masked tokens contribute to the accumulated
+    importance.
     """
 
     _act_sync_dict = {
@@ -106,6 +111,9 @@ class IMatrixMSEObserver(Observer):
                 return
 
             x_f = x.detach().to(IMATRIX_PRECISION)
+            x_f = mask_activations_with_loss_mask(
+                x_f, module_name=type(mod).__name__, strict=True
+            )
             device = x_f.device
             n_tokens = math.prod(x_f.shape[:-1])
             token_sum = x_f.pow(2).sum(dim=list(range(x_f.dim() - 1)))

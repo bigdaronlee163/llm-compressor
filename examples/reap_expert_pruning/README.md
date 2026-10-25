@@ -47,3 +47,14 @@ Then, the compressed models were evaluated on the `gsm8k_platinum_cot_llama` tas
 |  | REAP 50% -> 32 | 0.1368 | 0.1414 | 16.99% | 16.47 |
 
 As can be seen, the Qwen3 model has very high recovery, both at 25% and 50% sparsity. The smaller Moonlight model has less redundancy across its experts, so it has a modest recovery at 25% sparsity and an extremely poor recovery at 50% sparsity. This demonstrates that REAP is only effective to the extent to which the original model's experts are redundant.
+
+## Token masking
+
+By default every calibration token contributes to the saliency average `S_j`. When calibrating with chat data, the prompt can dominate that average, which favors experts that mostly process the prompt. Enabling `use_loss_mask=True` with a per-token `loss_mask` field restricts the saliency to the tokens the model generates:
+
+```bash
+python3 reap_masking_example.py                        # assistant-only saliency
+python3 reap_masking_example.py --no-use-loss-mask     # baseline, for comparison
+```
+
+Masking works both with `moe_calibrate_all_experts=False` (sparse routing, the default for REAP) and with `moe_calibrate_all_experts=True`: the router decisions and the recorded expert output norms are filtered together so they stay aligned. See [Choosing your dataset](../../docs/steps/choosing-dataset.md#token-masking) for the dataset format.

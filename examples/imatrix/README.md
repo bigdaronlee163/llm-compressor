@@ -60,6 +60,17 @@ W4A16, Llama-3.1-8B, group_size=128, WikiText-2 token-level perplexity (141 chun
 | RTN `imatrix_mse` | 6.85 |
 | GPTQ + `imatrix_mse` | 6.83 |
 
+## Token masking
+
+`imatrix_mse` (and `nvfp4_expanded_imatrix`) only accumulate importance over tokens enabled by the calibration `loss_mask`, so the per-channel importance can be restricted to the tokens the model actually generates. Enable it with `use_loss_mask=True` and a per-token `loss_mask` field in the dataset:
+
+```bash
+python3 llama3_imatrix_masking_example.py               # assistant-only importance
+python3 llama3_imatrix_masking_example.py --no-use-loss-mask  # baseline, for comparison
+```
+
+See [Choosing your dataset](../../docs/steps/choosing-dataset.md#token-masking) for the dataset format and the limitations.
+
 ## Questions or Feature Request?
 
 Please open up an issue on `vllm-project/llm-compressor`

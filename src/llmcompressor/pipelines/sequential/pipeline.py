@@ -188,13 +188,19 @@ class SequentialPipeline(CalibrationPipeline):
                 else None
             )
 
-            # Populate loss_masks once from cached activations for AWQ masking support
+            # Populate loss_masks once from cached activations for token masking
             use_loss_mask = getattr(dataset_args, "use_loss_mask", False)
             if use_loss_mask:
-                session.state.loss_masks = [
+                loss_masks = [
                     activations.fetch(batch_idx, ["loss_mask"]).get("loss_mask")
                     for batch_idx in range(len(dataloader))
                 ]
+                if any(loss_mask is None for loss_mask in loss_masks):
+                    raise ValueError(
+                        "`use_loss_mask=True` requires every calibration batch to "
+                        "contain a `loss_mask` field"
+                    )
+                session.state.loss_masks = loss_masks
             else:
                 session.state.loss_masks = None
 

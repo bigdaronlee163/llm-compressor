@@ -140,6 +140,14 @@ importance like the normal ImatrixObserver
 | RTN `imatrix_mse` | 6.85 |
 | GPTQ + `imatrix_mse` | 6.83 |
 
+## Token Masking
+
+Observers can be restricted to a subset of calibration tokens, typically the assistant responses of a chat dataset. Enable it with `oneshot(..., use_loss_mask=True)` and a per-token `loss_mask` field in the dataset; see [Choosing your dataset](../steps/choosing-dataset.md#token-masking) for the dataset format, a support matrix, and the limitations.
+
+Statistics collected through the calibration hooks (`calibrate_input_hook` / `calibrate_output_hook`) only see the enabled tokens, so every MinMax and MSE observer honors the mask automatically, as does the IMatrix observer. Weight statistics and quantization parameters computed outside of calibration (for example `weight_observer`) are unaffected.
+
+When the mask cannot be aligned with the observed tensor (for example when a routed MoE expert only received a subset of the sequence), the activation observers log a single warning and observe the unmasked tensor instead of failing calibration. The IMatrix observer raises in that case, since a silently unmasked importance estimate would be misleading.
+
 ## Observer Fusion (global_scale)
 
 For TENSOR_GROUP quantization schemes (e.g., NVFP4), layers that are fused at inference time (Q/K/V projections, gate/up MLP projections) must share the same `global_scale`. This is handled automatically by observer fusion:

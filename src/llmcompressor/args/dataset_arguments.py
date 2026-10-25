@@ -296,9 +296,11 @@ class DatasetArguments(CustomDatasetArguments):
     use_loss_mask: bool = field(
         default=False,
         metadata={
-            "help": "Whether to use the 'loss_mask' field from the batch for AWQ "
-            "loss calculation. When True, only tokens where loss_mask=1 contribute "
-            "to the AWQ optimization objective."
+            "help": "Whether to use the 'loss_mask' field from the batch to "
+            "restrict calibration to a subset of tokens. When True, only tokens "
+            "where loss_mask=1 contribute to the statistics collected by "
+            "modifiers such as AWQ and GPTQ (for example, only assistant "
+            "responses)."
         },
     )
     dataloader_num_workers: int = field(

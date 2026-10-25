@@ -15,6 +15,8 @@ from compressed_tensors.utils import (
     update_offload_parameter,
 )
 
+from llmcompressor.modifiers.utils.masking import select_masked_tokens
+
 GPTQ_PRECISION = torch.float32
 MIN_BATCHED_CHOLESKY_SIZE = 16
 
@@ -42,12 +44,17 @@ def accumulate_hessian(
     module: torch.nn.Module,
     hessian: torch.Tensor,
     num_samples: torch.Tensor,
+    loss_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Accumulate one module-input batch into its GPTQ Hessian statistics.
 
     The Hessian and sample counter are updated in place and returned for the
     hook caller to retain. Linear, Conv1D, and Conv2d inputs are reshaped into
     the common ``[input_features, observations]`` representation first.
+
+    When a per-token ``loss_mask`` is provided, only tokens where the mask is
+    truthy contribute to the Hessian. Token masking is only supported for
+    Linear and Conv1D modules.
     """
     inp = inp.to(device=hessian.device)
     if len(inp.shape) == 2:
@@ -58,10 +65,17 @@ def accumulate_hessian(
     num_added = inp.shape[0]
     match module:
         case torch.nn.Linear() | transformers.Conv1D():
+            if loss_mask is not None:
+                inp = select_masked_tokens(inp, loss_mask, type(module).__name__)
             if len(inp.shape) == 3:
                 inp = inp.reshape((-1, inp.shape[-1]))
             inp = inp.t()
         case torch.nn.Conv2d():
+            if loss_mask is not None:
+                raise ValueError(
+                    "Token masking (`use_loss_mask=True`) is not supported for "
+                    "Conv2d modules"
+                )
             unfold = torch.nn.Unfold(
                 module.kernel_size,
                 dilation=module.dilation,
@@ -98,6 +112,15 @@ def prepare_batch(
     for module in batch:
         hessian = hessians_by_module.pop(module)
         num_samples = num_samples_by_module.pop(module).to(device=hessian.device)
+        if not torch.any(torch.diagonal(hessian)):
+            raise ValueError(
+                "No calibration tokens contributed to the Hessian of a "
+                f"{type(module).__name__} module. This can happen when every token "
+                "is masked out by the calibration `loss_mask` or when the module "
+                "only ever received zero-valued inputs. Please check the "
+                "calibration data and, if `use_loss_mask=True`, the dataset's "
+                "`loss_mask` values."
+            )
         hessian_list.append(hessian / num_samples)
     hessians = torch.stack(hessian_list)
     del hessian_list

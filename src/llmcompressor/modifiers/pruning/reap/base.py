@@ -30,9 +30,78 @@ from llmcompressor.modifiers.pruning.reap.utils import (
     prune_moe_layer,
     update_model_config,
 )
+from llmcompressor.modifiers.utils.masking import get_active_loss_mask
 from llmcompressor.utils.dev import get_main_device
 
 __all__ = ["REAPPruningModifier"]
+
+
+def _apply_loss_mask(
+    top_k_indices: torch.Tensor,
+    top_k_weights: torch.Tensor,
+    norm_buffer: dict[int, torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor, dict[int, torch.Tensor]]:
+    """
+    Restrict router decisions and expert output norms to masked tokens.
+
+    Called before saliency accumulation so that tokens excluded by the
+    calibration ``loss_mask`` do not contribute to the REAP saliency. Returns
+    the inputs unchanged when no mask is active.
+
+    :param top_k_indices: ``[num_tokens, top_k]`` selected expert ids
+    :param top_k_weights: ``[num_tokens, top_k]`` gate weight per selection
+    :param norm_buffer: per-expert output norms, ``[num_tokens]`` per expert
+    :return: masked router decisions and norms
+    """
+    loss_mask = get_active_loss_mask(device=top_k_indices.device)
+    if loss_mask is None:
+        return top_k_indices, top_k_weights, norm_buffer
+
+    flat_mask = loss_mask.reshape(-1).to(dtype=torch.bool)
+    num_tokens = top_k_indices.shape[0]
+    if flat_mask.numel() != num_tokens:
+        raise ValueError(
+            f"Loss mask has {flat_mask.numel()} entries, but the router received "
+            f"{num_tokens} tokens. Token masking requires the calibration loss "
+            "mask to align with router inputs."
+        )
+
+    if get_calibrate_all_experts_flag():
+        masked_norms = {
+            expert_idx: norms[flat_mask]
+            for expert_idx, norms in norm_buffer.items()
+            if norms.shape[0] == num_tokens
+        }
+        if len(masked_norms) != len(norm_buffer):
+            raise ValueError(
+                "Not every expert recorded output norms for all tokens. REAP "
+                "token masking requires all-expert calibration."
+            )
+
+        return top_k_indices[flat_mask], top_k_weights[flat_mask], masked_norms
+
+    # Sparse routing: expert norms are ordered by (slot, token), matching
+    # top_k_indices.T.reshape(-1) and the torch.where order used when experts
+    # are called (see LinearExperts2D.forward)
+    flat_idx = top_k_indices.T.reshape(-1)
+    token_ids = torch.arange(num_tokens, device=flat_mask.device).repeat(
+        top_k_indices.shape[1]
+    )
+    keep = flat_mask[token_ids]
+
+    masked_norms = {}
+    for expert_idx, norms in norm_buffer.items():
+        expert_keep = keep[flat_idx == expert_idx]
+        if expert_keep.numel() != norms.shape[0]:
+            raise ValueError(
+                f"Expert {expert_idx} recorded {norms.shape[0]} output norms, but "
+                f"{expert_keep.numel()} routed tokens were selected by the loss "
+                "mask. REAP token masking requires expert norms to align with "
+                "router decisions."
+            )
+        masked_norms[expert_idx] = norms[expert_keep]
+
+    return flat_idx[keep], top_k_weights.T.reshape(-1)[keep], masked_norms
 
 
 class REAPPruningModifier(Modifier):
@@ -54,6 +123,11 @@ class REAPPruningModifier(Modifier):
     experts, the structural pruning for a layer is executed when it
     completes (``SEQUENTIAL_EPOCH_END``). The config is updated to reflect the new
     number of experts in ``on_finalize``.
+
+    When the calibration dataset provides a ``loss_mask`` and
+    ``use_loss_mask=True``, only masked tokens contribute to the saliency. This
+    works both with ``moe_calibrate_all_experts=True`` and with sparse routing
+    (``moe_calibrate_all_experts=False``).
 
     :param sparsity: fraction of experts to remove per layer (0, 1).
     :param ignore: module name patterns to skip during MoE layer detection.
@@ -320,6 +394,10 @@ class REAPPruningModifier(Modifier):
             return
 
         norm_buffer = self._norm_buffers[layer_name]
+
+        top_k_indices, top_k_weights, norm_buffer = _apply_loss_mask(
+            top_k_indices, top_k_weights, norm_buffer
+        )
 
         with torch.no_grad():
             tracker.update(top_k_indices, top_k_weights, norm_buffer)

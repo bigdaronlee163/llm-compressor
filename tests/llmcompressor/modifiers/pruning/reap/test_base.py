@@ -4,10 +4,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers.configuration_utils import PretrainedConfig
 
-from llmcompressor.core import Event, EventType, State
+from llmcompressor.core import Event, EventType, State, create_session
 from llmcompressor.modeling.moe.linear_experts import ExpertMLP, LinearExperts2D
 from llmcompressor.modifiers.factory import ModifierFactory
 from llmcompressor.modifiers.pruning.reap import REAPPruningModifier
+from llmcompressor.modifiers.pruning.reap.base import _apply_loss_mask
 from llmcompressor.modifiers.pruning.reap.utils import (
     REAPSaliencyTracker,
     get_moe_attrs,
@@ -911,3 +912,105 @@ def test_reap_forward_pass_after_pruning():
             assert out.shape == (2, 4, config.hidden_size)
             assert not torch.isnan(out).any()
             assert not torch.isinf(out).any()
+
+
+# ---------------------------------------------------------------------------
+# Tests: token masking
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestREAPTokenMasking:
+    @pytest.fixture(autouse=True)
+    def calibrate_all_experts(self):
+        import llmcompressor.modeling.moe.context as context
+
+        original = context._CALIBRATE_ALL_EXPERTS
+        context._CALIBRATE_ALL_EXPERTS = True
+        yield
+        context._CALIBRATE_ALL_EXPERTS = original
+
+    def _setup(self):
+        torch.manual_seed(0)
+        config = FakeMoEConfig(
+            num_experts=4,
+            hidden_size=8,
+            intermediate_size=16,
+            num_hidden_layers=1,
+        )
+        model = FakeMoEModel(config)
+        model.eval()
+        modifier = REAPPruningModifier(sparsity=0.5)
+        state = _make_state(model)
+        modifier.initialize(state)
+        modifier.update_event(state, Event(type_=EventType.CALIBRATION_START))
+        return model, modifier, config
+
+    def _calibrate(self, model, loss_mask):
+        with create_session() as session:
+            session.state.loss_masks = [loss_mask]
+            session.state.current_batch_idx = 0
+            with torch.no_grad():
+                model(torch.randn(2, 4, model.config.hidden_size))
+
+    def test_masked_saliency_counts_only_masked_tokens(self):
+        model, modifier, config = self._setup()
+        loss_mask = torch.tensor([[1, 0, 1, 0], [0, 1, 1, 0]], dtype=torch.bool)
+
+        self._calibrate(model, loss_mask)
+
+        tracker = next(iter(modifier._saliency_trackers.values()))
+        kept_tokens = int(loss_mask.sum())
+        expected = kept_tokens * config.num_experts_per_tok
+        assert tracker.total_count == pytest.approx(expected)
+
+    def test_unmasked_saliency_counts_all_tokens(self):
+        model, modifier, config = self._setup()
+
+        with create_session():
+            with torch.no_grad():
+                model(torch.randn(2, 4, model.config.hidden_size))
+
+        tracker = next(iter(modifier._saliency_trackers.values()))
+        expected = 8 * config.num_experts_per_tok
+        assert tracker.total_count == pytest.approx(expected)
+
+    def test_masked_saliency_with_sparse_routing(self):
+        import llmcompressor.modeling.moe.context as context
+
+        context._CALIBRATE_ALL_EXPERTS = False
+        model, modifier, config = self._setup()
+        loss_mask = torch.tensor([[1, 0, 1, 0], [0, 1, 1, 0]], dtype=torch.bool)
+
+        self._calibrate(model, loss_mask)
+
+        tracker = next(iter(modifier._saliency_trackers.values()))
+        kept_tokens = int(loss_mask.sum())
+        expected = kept_tokens * config.num_experts_per_tok
+        assert tracker.total_count == pytest.approx(expected)
+
+    def test_apply_loss_mask_without_mask_is_identity(self):
+        indices = torch.zeros(6, 2, dtype=torch.long)
+        weights = torch.ones(6, 2)
+        norms = {idx: torch.ones(6) for idx in range(4)}
+
+        with create_session():
+            out_indices, out_weights, out_norms = _apply_loss_mask(
+                indices, weights, norms
+            )
+
+        assert out_indices is indices
+        assert out_weights is weights
+        assert out_norms is norms
+
+    def test_apply_loss_mask_mismatch_raises(self):
+        indices = torch.zeros(6, 2, dtype=torch.long)
+        weights = torch.ones(6, 2)
+        norms = {idx: torch.ones(6) for idx in range(4)}
+
+        with create_session() as session:
+            session.state.loss_masks = [torch.ones(4, dtype=torch.bool)]
+            session.state.current_batch_idx = 0
+
+            with pytest.raises(ValueError, match="Loss mask has"):
+                _apply_loss_mask(indices, weights, norms)

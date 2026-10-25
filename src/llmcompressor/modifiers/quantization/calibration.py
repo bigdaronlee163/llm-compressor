@@ -16,6 +16,7 @@ from compressed_tensors.utils import (
 from loguru import logger
 from torch.nn import Module
 
+from llmcompressor.modifiers.utils.masking import mask_activations_with_loss_mask
 from llmcompressor.observers import Observer
 
 __all__ = [
@@ -184,16 +185,28 @@ def update_qparams(
 def calibrate_input_hook(module: Module, args: Any):
     """
     Hook to calibrate input activations by accumulating statistics in the observer.
+
+    When token masking is enabled, only the tokens selected by the current
+    batch's `loss_mask` contribute to the observer statistics.
     """
     args = args[0] if isinstance(args, tuple) else args
+    if isinstance(args, torch.Tensor):
+        args = mask_activations_with_loss_mask(args, type(module).__name__)
     module.input_observer(args)
 
 
 def calibrate_output_hook(module: Module, _args: Any, output: torch.Tensor):
     """
     Hook to calibrate output activations by accumulating statistics in the observer.
+
+    When token masking is enabled, only the tokens selected by the current
+    batch's `loss_mask` contribute to the observer statistics. The output which
+    is quantized and returned to the model is never masked.
     """
-    module.output_observer(output)
+    observed = output
+    if isinstance(observed, torch.Tensor):
+        observed = mask_activations_with_loss_mask(observed, type(module).__name__)
+    module.output_observer(observed)
     output = forward_quantize(
         module=module,
         value=output,

@@ -146,3 +146,14 @@ We can see the resulting scores look good!
 ### Questions or Feature Request?
 
 Please open up an issue on `vllm-project/llm-compressor`
+
+## Token masking for static activations
+
+When the activation ranges are static (`dynamic=False`), the calibration data directly determines the scale of every input tensor. `llama3_static_activation_masking_example.py` restricts the observed activations to the tokens the model actually generates, by enabling `use_loss_mask=True` with a per-token `loss_mask` field in the dataset:
+
+```bash
+python3 llama3_static_activation_masking_example.py               # assistant-only ranges
+python3 llama3_static_activation_masking_example.py --no-use-loss-mask  # baseline
+```
+
+Both input and output observers honor the mask. See [Choosing your dataset](../../docs/steps/choosing-dataset.md#token-masking) for the dataset format and the limitations.

@@ -50,7 +50,7 @@ class BasicPipeline(CalibrationPipeline):
             getattr(dataset_args, "use_loss_mask", False) if dataset_args else False
         )
 
-        # Initialize loss_masks list for AWQ masking support
+        # Initialize loss_masks list for token masking support
         if use_loss_mask:
             session.state.loss_masks = []
 
@@ -62,9 +62,16 @@ class BasicPipeline(CalibrationPipeline):
             for batch_idx, batch in enumerate(
                 tqdm.tqdm(dataloader, desc="Calibrating")
             ):
-                # Collect loss mask from this batch before moving to device
+                # Loss masks are consumed by modifiers through the session state,
+                # so they must not be forwarded to the model
+                loss_mask = batch.pop("loss_mask", None)
                 if use_loss_mask:
-                    session.state.loss_masks.append(batch.get("loss_mask"))
+                    if loss_mask is None:
+                        raise ValueError(
+                            "`use_loss_mask=True` requires every calibration batch "
+                            "to contain a `loss_mask` field"
+                        )
+                    session.state.loss_masks.append(loss_mask)
 
                 # Set current batch index before forward pass
                 session.state.current_batch_idx = batch_idx

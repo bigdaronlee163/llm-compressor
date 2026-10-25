@@ -160,6 +160,16 @@ def format_calibration_data(
     tokenized_dataset: Dataset,
     processor: Processor,
 ) -> DataLoader:
+    if getattr(args, "use_loss_mask", False):
+        column_names = getattr(tokenized_dataset, "column_names", None)
+        if column_names is not None and "loss_mask" not in column_names:
+            raise ValueError(
+                "`use_loss_mask=True` requires the calibration dataset to contain "
+                "a `loss_mask` column (1 = include the token, 0 = exclude it). "
+                "Either add the column to your dataset or set "
+                "`use_loss_mask=False`."
+            )
+
     # Pin memory only when using workers (saves RAM for low-memory users when
     # num_workers=0; when num_workers>0, pin_memory speeds CPU->GPU transfer)
     num_workers = args.dataloader_num_workers
@@ -217,7 +227,13 @@ def _make_collate_fn(args: DatasetArguments, processor: Processor) -> Callable:
                 "truncation specified by `max_seq_length`"
             )
 
-        return DataCollatorWithPadding(tokenizer)
+        collator = DataCollatorWithPadding(tokenizer)
+        if getattr(args, "use_loss_mask", False):
+            return _PaddingCollatorWithLossMask(
+                collator, padding_side=getattr(tokenizer, "padding_side", "right")
+            )
+
+        return collator
 
     else:
         raise ValueError(f"Unknown data collator {args.data_collator}")
@@ -294,6 +310,54 @@ def _make_sampler(args: DatasetArguments, dataset: Dataset) -> Sampler:
         return LengthAwareSampler(
             dataset, num_samples=num_samples, batch_size=batch_size
         )
+
+
+class _PaddingCollatorWithLossMask:
+    """
+    Padding collator which also pads the optional ``loss_mask`` field.
+
+    Tokenizer-based padding collators cannot pad fields they do not know about,
+    so the loss mask is removed before collation and re-added afterwards with
+    zeros that match the tokenizer's padding side.
+    """
+
+    def __init__(self, collator: Callable, padding_side: str = "right"):
+        self.collator = collator
+        self.padding_side = padding_side
+
+    def __call__(self, features: list[dict[str, Any]]) -> dict[str, Any]:
+        loss_masks = []
+        has_loss_mask = False
+        stripped_features = []
+        for feature in features:
+            feature = dict(feature)
+            loss_mask = feature.pop("loss_mask", None)
+            loss_masks.append(loss_mask)
+            has_loss_mask |= loss_mask is not None
+            stripped_features.append(feature)
+
+        batch = self.collator(stripped_features)
+        if not has_loss_mask:
+            return batch
+
+        seq_len = batch["input_ids"].shape[-1]
+        batch["loss_mask"] = torch.tensor(
+            [self._pad_mask(loss_mask, seq_len) for loss_mask in loss_masks],
+            dtype=torch.long,
+        )
+        return batch
+
+    def _pad_mask(self, loss_mask: Any, seq_len: int) -> list[int]:
+        if loss_mask is None:
+            return [0] * seq_len
+
+        mask = list(loss_mask)
+        if self.padding_side == "left":
+            mask = mask[-seq_len:]
+            return [0] * (seq_len - len(mask)) + mask
+
+        mask = mask[:seq_len]
+        return mask + [0] * (seq_len - len(mask))
 
 
 class DataCollatorWithTruncation:
